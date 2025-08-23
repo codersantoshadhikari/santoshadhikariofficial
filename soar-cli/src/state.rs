@@ -14,10 +14,11 @@ use soar_core::{
         connection::Database,
         migration::MigrationManager,
         models::FromRow,
+        nests,
         packages::{FilterCondition, PackageQueryBuilder},
     },
     error::{ErrorContext, SoarError},
-    metadata::fetch_metadata,
+    metadata::{fetch_metadata, fetch_nest_metadata},
     SoarResult,
 };
 use tracing::{error, info};
@@ -49,7 +50,50 @@ impl AppState {
     }
 
     pub async fn sync(&self) -> SoarResult<()> {
-        self.init_repo_dbs(true).await
+        self.init_repo_dbs(true).await?;
+        self.sync_nests(true).await
+    }
+
+    async fn sync_nests(&self, force: bool) -> SoarResult<()> {
+        let mut nests_db = self.config().get_nests_db_conn()?;
+        let tx = nests_db.transaction()?;
+        let nests = nests::repository::list(&tx)?;
+        tx.commit()?;
+
+        let nests_repo_path = self.config().get_repositories_path()?.join("nests");
+
+        let mut tasks = Vec::new();
+
+        for nest in nests {
+            let nest_clone = nest.clone();
+            let repo_path_clone = nests_repo_path.clone();
+            let task = tokio::task::spawn(async move {
+                fetch_nest_metadata(&nest_clone, force, &repo_path_clone).await
+            });
+            tasks.push((task, nest));
+        }
+
+        for (task, nest) in tasks {
+            match task
+                .await
+                .map_err(|err| SoarError::Custom(format!("Join handle error: {err}")))?
+            {
+                Ok(Some(etag)) => {
+                    let nest_path = nests_repo_path.join(&nest.name);
+                    let metadata_db_path = nest_path.join("metadata.db");
+                    let conn = Connection::open(metadata_db_path)?;
+                    conn.execute(
+                        "UPDATE repository SET name = ?, etag = ?",
+                        params![format!("nest-{}", nest.name), etag],
+                    )?;
+                    info!("[{}] Nest synced", Colored(Magenta, &nest.name))
+                }
+                Err(err) => error!("Failed to sync nest {}: {err}", nest.name),
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 
     async fn init_repo_dbs(&self, force: bool) -> SoarResult<()> {
@@ -70,12 +114,7 @@ impl AppState {
                     self.validate_packages(repo, &etag).await?;
                     info!("[{}] Repository synced", Colored(Magenta, &repo.name));
                 }
-                Err(err) => {
-                    if !matches!(err, SoarError::FailedToFetchRemote(_)) {
-                        return Err(err);
-                    }
-                    error!("{err}");
-                }
+                Err(err) => error!("Failed to sync repository {}: {err}", repo.name),
                 _ => {}
             };
         }
@@ -159,9 +198,8 @@ impl AppState {
     }
 
     fn create_repo_db(&self) -> SoarResult<Database> {
-        let repo_paths: Vec<PathBuf> = self
-            .inner
-            .config
+        let mut repo_paths: Vec<PathBuf> = self
+            .config()
             .repositories
             .iter()
             .filter_map(|r| {
@@ -172,11 +210,26 @@ impl AppState {
             })
             .collect();
 
+        let mut nests_db = self.config().get_nests_db_conn()?;
+        let tx = nests_db.transaction()?;
+        let nests = nests::repository::list(&tx)?;
+        tx.commit()?;
+
+        let nests_repo_path = self.config().get_repositories_path()?.join("nests");
+
+        for nest in nests {
+            let nest_path = nests_repo_path.join(&nest.name);
+            let metadata_db = nest_path.join("metadata.db");
+            if metadata_db.is_file() {
+                repo_paths.push(metadata_db);
+            }
+        }
+
         Database::new_multi(repo_paths.as_ref())
     }
 
     fn create_core_db(&self) -> SoarResult<Database> {
-        let core_db_file = self.inner.config.get_db_path()?.join("soar.db");
+        let core_db_file = self.config().get_db_path()?.join("soar.db");
         if !core_db_file.exists() {
             File::create(&core_db_file)
                 .with_context(|| format!("creating database file {}", core_db_file.display()))?;
@@ -188,12 +241,14 @@ impl AppState {
         Database::new(&core_db_file)
     }
 
+    #[inline]
     pub fn config(&self) -> &Config {
         &self.inner.config
     }
 
     pub async fn repo_db(&self) -> SoarResult<&Arc<Mutex<Connection>>> {
         self.init_repo_dbs(false).await?;
+        self.sync_nests(false).await?;
         self.inner
             .repo_db
             .get_or_try_init(|| self.create_repo_db())

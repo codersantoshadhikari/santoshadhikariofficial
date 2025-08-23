@@ -11,6 +11,7 @@ use toml_edit::{DocumentMut, Item};
 use tracing::{info, warn};
 
 use crate::{
+    database::migration,
     error::{ConfigError, SoarError},
     repositories::get_platform_repositories,
     toml::{annotate_toml_array_of_tables, annotate_toml_table},
@@ -20,6 +21,7 @@ use crate::{
     },
     SoarResult,
 };
+use rusqlite::Connection;
 
 type Result<T> = std::result::Result<T, ConfigError>;
 
@@ -96,11 +98,11 @@ pub struct Repository {
 
     /// Enables signature verification for this repository.
     /// Default is derived based on the existence of `pubkey`
-    signature_verification: Option<bool>,
+    pub signature_verification: Option<bool>,
 
     /// Optional sync interval (e.g., "1h", "12h", "1d").
     /// Default: "3h"
-    sync_interval: Option<String>,
+    pub sync_interval: Option<String>,
 }
 
 impl Repository {
@@ -202,6 +204,9 @@ pub struct Config {
 
     /// Global override for sync interval
     pub sync_interval: Option<String>,
+
+    /// Sync interval for nests
+    pub nests_sync_interval: Option<String>,
 }
 
 pub static CONFIG: LazyLock<RwLock<Option<Config>>> = LazyLock::new(|| RwLock::new(None));
@@ -338,6 +343,7 @@ impl Config {
             signature_verification: None,
             desktop_integration: None,
             sync_interval: None,
+            nests_sync_interval: None,
         }
     }
 
@@ -390,6 +396,11 @@ impl Config {
         for repo in &mut self.repositories {
             if repo.name == "local" {
                 return Err(ConfigError::ReservedRepositoryName);
+            }
+            if repo.name.starts_with("nest") {
+                return Err(ConfigError::Custom(
+                    "Repository name cannot start with `nest`".to_string(),
+                ));
             }
             if !seen_repos.insert(&repo.name) {
                 return Err(ConfigError::DuplicateRepositoryName(repo.name.clone()));
@@ -494,6 +505,24 @@ impl Config {
             return build_path(portable_dirs);
         }
         self.default_profile()?.get_portable_dirs()
+    }
+
+    pub fn get_nests_db_conn(&self) -> SoarResult<Connection> {
+        let path = self.get_db_path()?.join("nests.db");
+        let conn = Connection::open(&path)?;
+        migration::run_nests(conn)
+            .map_err(|e| SoarError::Custom(format!("run nests migration: {}", e)))?;
+        let conn = Connection::open(&path)?;
+        Ok(conn)
+    }
+
+    pub fn get_nests_sync_interval(&self) -> u128 {
+        match get_config().nests_sync_interval.as_deref().unwrap_or("3h") {
+            "always" => 0,
+            "never" => u128::MAX,
+            "auto" => 3 * 3_600_000,
+            value => parse_duration(value).unwrap_or(3_600_000),
+        }
     }
 
     pub fn get_repository(&self, repo_name: &str) -> Option<&Repository> {
