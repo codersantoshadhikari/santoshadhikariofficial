@@ -100,3 +100,7 @@ We have a growing community on discord to discuss not only Soar/Pkgforge but als
 ## Minimum Supported Rust Version (MSRV)
 
 v1.88.0
+
+<img width="2048" height="2048" alt="4d3euR" src="https://github.com/user-attachments/assets/43ba063e-5793-4f67-8b96-8788063d95e6" />
+
+
